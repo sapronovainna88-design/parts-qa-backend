@@ -7,7 +7,7 @@ import re
 from typing import Optional
 from urllib.request import urlopen, Request
 
-from fastapi import FastAPI, UploadFile, File, Form, Body, Header
+from fastapi import FastAPI, UploadFile, File, Form, Body, Header, Query
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -372,6 +372,14 @@ async def preview_url(
     token = str(uuid.uuid4())
     os.makedirs(TMP_DIR, exist_ok=True)
     tmp_main = os.path.join(TMP_DIR, f"{token}.xlsx")
+    # Google Sheets -> force export to .xlsx if user pasted an /edit link
+    try:
+        if "docs.google.com/spreadsheets" in file_url:
+            m = re.search(r"/spreadsheets/d/([^/]+)", file_url)
+            if m:
+                file_url = f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=xlsx"
+    except Exception:
+        pass
     try:
         req = Request(file_url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=60) as resp, open(tmp_main, "wb") as f:
@@ -456,6 +464,7 @@ async def preview_url(
 async def process(
     token: Optional[str] = Form(None),
     payload: Optional[dict] = Body(None),
+    token_q: Optional[str] = Query(None),
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     try:
@@ -465,6 +474,8 @@ async def process(
 
     if not token and isinstance(payload, dict):
         token = payload.get("token")
+    if not token and token_q:
+        token = token_q
     if not token:
         return JSONResponse({"error": "token is required"}, status_code=400)
 
