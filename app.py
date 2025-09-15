@@ -3,6 +3,9 @@ import os, io, uuid, re
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, Body, Header
+
+
+
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -123,7 +126,7 @@ async def preview(
     except PermissionError:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    # сохраняем входной файл
+    # сохраняем входной файл под токен
     token = str(uuid.uuid4())
     os.makedirs(TMP_DIR, exist_ok=True)
     tmp_main = os.path.join(TMP_DIR, f"{token}.xlsx")
@@ -131,86 +134,78 @@ async def preview(
     with open(tmp_main, "wb") as f:
         f.write(content)
 
-    # читаем унификацию с понятными ошибками
+    # читаем уніфікацію
     try:
         df = load_unification()
     except Exception as e:
         return JSONResponse({"error": f"Помилка уніфікації: {e}"}, status_code=400)
 
-    # ---- подбор категории (фаззи) ----
+    # --- 1) Фиксируем тип (как в твоём фрагменте: строго по cat_norm) ---
     st_raw = (selected_type or "").strip()
     sb_raw = (selected_brand or "").strip()
     st = _norm_text(st_raw)
     sb = _norm_text(sb_raw)
 
-    cats = sorted(df["cat_norm"].dropna().unique().tolist())
-    if st not in cats:
-        cand = get_close_matches(st, cats, n=1, cutoff=0.45)
-        if cand:
-            st = cand[0]
-        else:
-            suggestions = get_close_matches(st, cats, n=5, cutoff=0.3)
-            return JSONResponse(
-                {"error": f"Категорію «{selected_type}» не знайдено",
-                 "suggestions": suggestions},
-                status_code=400
-            )
-
     df_cat = df[df["cat_norm"] == st]
+    if df_cat.empty:
+        # категория не найдена — подсказываем и выходим (здесь логично вернуть 400)
+        choices = df["cat_norm"].dropna().unique().tolist()
+        suggestions = get_close_matches(st, choices, n=3, cutoff=0.6)
+        return JSONResponse(
+            {"error": f"Категорію «{st_raw}» не знайдено", "suggestions": suggestions},
+            status_code=400
+        )
+    normalized_type = df_cat["Вид техніки"].iloc[0]
 
-    # ---- подбор бренда + fallback на "всі" ----
+    # --- 2) Бренд: подправляем к ближайшему и добавляем 'всі доступні моделі' в пул ---
+    norm_all = _norm_text("всі доступні моделі")
     brands_pool = df_cat["brand_norm"].dropna().unique().tolist()
-    has_all_row = _norm_text("всі доступні моделі") in brands_pool
+    pool_with_all = brands_pool + [norm_all]
 
-    brand_mode = "exact"
-    used_brand_norm = None
+    best = get_close_matches(sb, pool_with_all, n=1, cutoff=0.6)
+    if best:
+        sb = best[0]
 
-    if sb in ALL_BRAND_ALIASES:
-        df_brand = df_cat
-        brand_mode = "all"
-        used_brand_norm = "всі доступні моделі"
+    # --- 3) Берём строки БРЕНДА ИЛИ 'всі доступні моделі' ---
+    df_brand = df_cat[df_cat["brand_norm"].isin([sb, norm_all])]
+
+    # ⬇️ ВАЖНО: ЕСЛИ НИЧЕГО НЕ НАШЛИ — НЕ ОШИБКА!
+    # Делаем "пустую" уніфікацію: вернём token и продолжим обработку без маппинга.
+    if df_brand.empty:
+        temp_df = pd.DataFrame(columns=["C (Найменування)", "D (Каталожний номер)", "E (Допустимі аналоги)"])
+        brand_mode = "none_found_unification_skipped"
+        normalized_brand = sb_raw or "—"
     else:
-        best = get_close_matches(sb, brands_pool, n=1, cutoff=0.6)
-        if best:
-            used_brand_norm = best[0]
-            df_brand = df_cat[df_cat["brand_norm"] == used_brand_norm]
+        temp_df = (
+            df_brand[["Найменування", "каталожний номер", "Допустимі аналоги"]]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+        temp_df.columns = ["C (Найменування)", "D (Каталожний номер)", "E (Допустимі аналоги)"]
+        if sb == norm_all:
+            brand_mode = "all_manual_or_corrected"
+            normalized_brand = "Всі доступні моделі"
+        elif sb in brands_pool:
+            brand_mode = "exact_plus_all" if norm_all in brands_pool else "exact"
+            normalized_brand = df_cat.loc[df_cat["brand_norm"] == sb, "Бренд"].iloc[0]
         else:
-            if has_all_row:
-                df_brand = df_cat
-                brand_mode = "fallback_all"
-                used_brand_norm = "всі доступні моделі"
-            else:
-                suggestions = get_close_matches(sb, brands_pool, n=5, cutoff=0.4)
-                if "всі доступні моделі" not in suggestions:
-                    suggestions.append("всі доступні моделі")
-                return JSONResponse(
-                    {"error": f"Бренд «{selected_brand}» не знайдено для цієї категорії",
-                     "suggestions": suggestions},
-                    status_code=400
-                )
+            brand_mode = "exact_or_all"
+            normalized_brand = sb_raw
 
-    # ---- формируем превью таблицу ----
-    temp_df = (
-        df_brand[["Найменування", "каталожний номер", "Допустимі аналоги"]]
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
-    temp_df.columns = ["C (Найменування)", "D (Каталожний номер)", "E (Допустимі аналоги)"]
-
-    # кладём временный preview рядом с токеном
+    # сохраняем «превью-таблицу» (пусть даже пустую) рядом с токеном
     tmp_temp = os.path.join(TMP_DIR, f"{token}_temp.parquet")
     temp_df.to_parquet(tmp_temp, index=False)
 
-    preview_markdown = tabulate(temp_df, headers=temp_df.columns, tablefmt="github", showindex=False)
-
-    # восстановим красивое имя категории из исходных данных
-    normalized_type = df_cat["Вид техніки"].iloc[0]
-    normalized_brand = used_brand_norm or sb
+    # markdown-превью: если таблица пустая — показываем заметку
+    if temp_df.empty:
+        preview_markdown = "_Уніфікація для цієї категорії/бренду не знайдена — обробка буде без уніфікації._"
+    else:
+        preview_markdown = tabulate(temp_df, headers=temp_df.columns, tablefmt="github", showindex=False)
 
     return {
         "normalized_type": normalized_type,
         "normalized_brand": normalized_brand,
-        "brand_mode": brand_mode,  # 'exact' | 'all' | 'fallback_all'
+        "brand_mode": brand_mode,   # exact | exact_plus_all | all_manual_or_corrected | none_found_unification_skipped
         "preview_markdown": preview_markdown,
         "token": token
     }
@@ -235,61 +230,108 @@ async def process(
 
     tmp_main = os.path.join(TMP_DIR, f"{token}.xlsx")
     tmp_temp = os.path.join(TMP_DIR, f"{token}_temp.parquet")
-    if not (os.path.exists(tmp_main) and os.path.exists(tmp_temp)):
+    if not os.path.exists(tmp_main):
         return JSONResponse({"error": "invalid token"}, status_code=400)
 
-    temp_df = pd.read_parquet(tmp_temp)
+    # читаем превью-таблицу (может быть пустой или отсутствовать)
+    temp_df = pd.DataFrame()
+    if os.path.exists(tmp_temp):
+        try:
+            temp_df = pd.read_parquet(tmp_temp)
+        except Exception:
+            temp_df = pd.DataFrame()
+
+    # ← вот тот самый «ранний флаг»
+    unification_enabled = not temp_df.empty
 
     wb = openpyxl.load_workbook(tmp_main)
     ws = wb.active
 
-    red    = PatternFill(start_color='FFFF0000', end_color='FFFF0000', fill_type='solid')
-    yellow = PatternFill(start_color='FFFFFF00', end_color='FFFFFF00', fill_type='solid')
+    red    = PatternFill(start_color="FFFF0000", end_color="FFFF0000", fill_type="solid")
+    yellow = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid")
     none   = PatternFill()
 
-    # простая логика подсветки (как в ранней версии)
+    def mark(cell, color, flags):
+        """color: 'red' | 'yellow' | 'none'; flags tracks итог для колонки A"""
+        if color == "red":
+            cell.fill = red
+            flags["had_red"] = True
+        elif color == "yellow":
+            cell.fill = yellow
+            flags["had_yellow"] = True
+        else:
+            cell.fill = none
+
+    from difflib import SequenceMatcher
+
     for row in ws.iter_rows(min_row=2):
+        # сброс заливки
         for cell in row:
             cell.fill = none
-        A = str(row[0].value or '')
-        D = str(row[3].value or '')
-        J = str(row[9].value or '')
-        L = str(row[11].value or '')
-        P = str(row[15].value or '').lower()
-        red_flag = False
 
-        if P == 'аналог':
-            matched = False
-            allowed = []
-            for _, r in temp_df.iterrows():
-                pn = str(r['D (Каталожний номер)'])
-                nums = [pn, pn.replace('.', '')]
-                if any(n and n in D for n in nums):
-                    matched = True
-                    allowed = [x.strip() for x in str(r['E (Допустимі аналоги)']).split(',') if x.strip()]
-                    break
-            if not matched:
-                base = A.split(',')[0].split('|')[0].strip().lower()
-                sims = temp_df['C (Найменування)'].apply(lambda x: SequenceMatcher(None, base, str(x).lower()).ratio())
-                idx = sims.idxmax()
-                ratio = float(sims.max())
-                allowed = [x.strip() for x in str(temp_df.at[idx, 'E (Допустимі аналоги)']).split(',') if x.strip()]
-                if ratio < 0.6:
-                    row[15].fill = red; red_flag = True
-                elif ratio < 0.8:
-                    if any(SequenceMatcher(None, J.lower(), a.lower()).ratio() >= 0.8 for a in allowed):
-                        row[0].fill = yellow; row[15].fill = yellow
-                    else:
-                        row[9].fill = red; row[15].fill = red; red_flag = True
-            # проверка J против допустимых аналогов
-            if (J.strip() and allowed) and not any(SequenceMatcher(None, J.lower(), a.lower()).ratio() >= 0.8 for a in allowed):
-                row[9].fill = yellow; row[15].fill = yellow
+        # A=0, D=3, J=9, L=11, P=15
+        A = str(row[0].value or "")
+        D = str(row[3].value or "")
+        J = str(row[9].value or "")
+        L = str(row[11].value or "")
+        P = str(row[15].value or "").lower()
+
+        flags = {"had_red": False, "had_yellow": False}
+
+        if P == "аналог":
+            if not unification_enabled:
+                # Уніфікації нет — ничего не подсвечиваем для «аналог» (просто пропускаем)
+                pass
+            else:
+                matched = False
+                allowed = []
+
+                # 1) Совпадение по каталожному номеру
+                for _, r in temp_df.iterrows():
+                    pn = str(r["D (Каталожний номер)"])
+                    nums = [pn, pn.replace(".", "")]
+                    if any(n and n in D for n in nums):
+                        matched = True
+                        allowed = [x.strip() for x in str(r["E (Допустимі аналоги)"]).split(",") if x.strip()]
+                        break
+
+                # 2) Если PN не нашли — сравнение по названию
+                if not matched:
+                    base = A.split(",")[0].split("|")[0].strip().lower()
+                    sims = temp_df["C (Найменування)"].apply(
+                        lambda x: SequenceMatcher(None, base, str(x).lower()).ratio()
+                    )
+                    if not sims.empty:
+                        idx = sims.idxmax()
+                        ratio = float(sims.max())
+                        allowed = [x.strip() for x in str(temp_df.at[idx, "E (Допустимі аналоги)"]).split(",") if x.strip()]
+
+                        if ratio < 0.6:
+                            mark(row[15], "red", flags)   # P
+                        elif ratio < 0.8:
+                            # неуверенно — подсветим мягко
+                            mark(row[0], "yellow", flags)  # A
+                            mark(row[15], "yellow", flags)
+
+                # 3) Проверка бренда J против допустимых аналогов
+                if allowed and J.strip():
+                    ok = any(SequenceMatcher(None, J.lower(), a.lower()).ratio() >= 0.8 for a in allowed)
+                    if not ok:
+                        close = any(SequenceMatcher(None, J.lower(), a.lower()).ratio() >= 0.6 for a in allowed)
+                        mark(row[9], "yellow" if close else "red", flags)  # J
+                        mark(row[15], "yellow" if close else "red", flags) # P
         else:
+            # базовая проверка: если в L указан код, он должен содержаться в D
             if L and L not in D:
-                row[11].fill = red; red_flag = True
+                mark(row[11], "red", flags)
 
-        if red_flag:
+        # сводная подсветка для A: красный > жёлтый > нет
+        if flags["had_red"]:
             row[0].fill = red
+        elif flags["had_yellow"]:
+            row[0].fill = yellow
+        else:
+            row[0].fill = none
 
     original_name = os.path.splitext(os.path.basename(tmp_main))[0]
     out_name = f"{original_name}_processed.xlsx"
