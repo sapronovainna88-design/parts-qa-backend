@@ -1,12 +1,13 @@
-# app.py — FastAPI backend for Railway (robust version)
-import os, io, uuid, re
-from urllib.request import urlopen, Request
+# app.py — FastAPI backend for Railway (robust, aliases + safe preview/process)
+# -*- coding: utf-8 -*-
+
+import os
+import uuid
+import re
 from typing import Optional
+from urllib.request import urlopen, Request
 
 from fastapi import FastAPI, UploadFile, File, Form, Body, Header
-
-
-
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -18,13 +19,12 @@ from openpyxl.styles import PatternFill
 
 # ----------------------------- Config -----------------------------
 APP_PORT = int(os.getenv("PORT", "8000"))
-UNIFICATION_PATH = os.getenv("UNIFICATION_PATH", "unifikatsiya.xlsx")
-TMP_DIR = os.getenv("TMP_DIR", "/tmp")
-API_KEY = os.getenv("X_API_KEY")  # optional simple auth
+UNIFICATION_PATH = os.getenv("UNIFICATION_PATH", "уніфікаувція для ШІ.xlsx")
+TMP_DIR = os.getenv("TMP_DIR", "tmp")
+API_KEY = os.getenv("X_API_KEY")  # optional, header: X-API-Key
+os.makedirs(TMP_DIR, exist_ok=True)
 
-ALL_BRAND_ALIASES = {"всі", "все", "all", "any", "*", "всі доступні моделі"}
-
-app = FastAPI(title="Parts QA Backend", version="1.1")
+app = FastAPI(title="Parts QA Backend", version="1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,86 +34,142 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------- Helpers: columns & norms -----------------
-def _norm_text(s: str) -> str:
-    x = str(s or "").strip().lower()
-    x = x.replace("ё", "е").replace("’", "'")
-    x = re.sub(r"\s+", " ", x)
-    return x
-
-# эквиваленты названий колонок (укр/рус/англ, популярные варианты)
-_COL_CANDIDATES = {
-    "cat": [
-        "вид техніки", "вид техники", "категорія", "категория",
-        "тип техніки", "тип техники", "вид"
-    ],
-    "brand": [
-        "бренд", "виробник", "производитель",
-        "виробник/бренд постачальника", "бренд постачальника", "brand"
-    ],
-    "name": [
-        "найменування", "наименование", "назва", "название", "name"
-    ],
-    "pn": [
-        "каталожний номер", "каталожный номер", "кат. номер",
-        "артикул", "part number", "pn", "код"
-    ],
-    "analogs": [
-        "допустимі аналоги", "допустимые аналоги", "аналоги",
-        "equivalents", "альтернативи", "alternative", "analog"
-    ],
+# ----------------------- Text utils & brand aliases -----------------
+BRAND_ALIASES = {
+    "john deere": {"jd", "john-deere", "john  deere", "джон дир", "джон дір", "джондір", "джон-дир"},
+    "horsch": {"horsh", "хорш", "horschmaschinen", "horsch-maschinen"},
+    "claas": {"клас", "класс"},
+    "case ih": {"case", "кейс", "кейс ih", "case-ih"},
+    "new holland": {"нью холланд", "нью-холланд", "nh", "нх"},
+    "vaderstad": {"вадерштад", "вадерстад", "vader-stad"},
 }
 
-def _pick_col(df: pd.DataFrame, key: str) -> str:
-    want = [_norm_text(x) for x in _COL_CANDIDATES[key]]
+TYPE_ALIASES = {
+    "сеялки": "посівна техніка",
+    "сеялка": "посівна техніка",
+    "посевная техника": "посівна техніка",
+}
+
+
+def _strip(s: str) -> str:
+    return str(s or "").strip()
+
+
+def _norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", _strip(s).lower())
+
+
+def _brand_key(s: str) -> str:
+    k = _norm_text(s)
+    k = k.replace("-", " ")
+    k = re.sub(r"[^a-z0-9\u0400-\u04FF ]+", "", k)
+    k = re.sub(r"\s+", " ", k).strip()
+    for canon, aliases in BRAND_ALIASES.items():
+        if k == canon or k in aliases:
+            return canon
+    if k == "jd":
+        return "john deere"
+    return k
+
+
+def _same_brand(a: str, b: str) -> bool:
+    return _brand_key(a) == _brand_key(b)
+
+
+def _pn_variants(pn: str):
+    pn = _strip(pn)
+    if not pn:
+        return []
+    v = {pn, pn.replace(".", ""), pn.replace("-", ""), re.sub(r"[.\-\s]", "", pn)}
+    return list(v)
+
+
+def _has_cyr(s: str) -> bool:
+    return bool(re.search("[\u0400-\u04FF]", str(s)))
+
+
+# ----------------------- Unification loading -----------------
+# Optional synonym mapping (in case headers differ slightly)
+_COLUMN_CANDIDATES = {
+    "Вид техніки": ["вид техніки", "вид техники", "тип техніки", "тип техники", "категорія", "категория", "вид"],
+    "Бренд": ["бренд", "виробник", "производитель", "виробник/бренд", "brand"],
+    "Найменування": ["найменування", "наименование", "назва", "название", "name"],
+    "каталожний номер": ["каталожний номер", "каталожный номер", "артикул", "part number", "pn", "код"],
+    "Допустимі аналоги": ["допустимі аналоги", "допустимые аналоги", "аналоги", "equivalents", "alternative"],
+}
+
+
+def _find_col(df: pd.DataFrame, canonical: str) -> str:
+    if canonical in df.columns:
+        return canonical
+    want = [_norm_text(x) for x in [canonical] + _COLUMN_CANDIDATES.get(canonical, [])]
     colmap = {orig: _norm_text(orig) for orig in df.columns}
-    # точные совпадения
+    # exact
     for w in want:
         for orig, normed in colmap.items():
             if normed == w:
                 return orig
-    # частичные совпадения (содержит)
+    # contains
     for w in want:
         for orig, normed in colmap.items():
             if w in normed:
                 return orig
-    raise ValueError(f"Колонку для «{key}» не знайдено. Є колонки: {list(df.columns)}")
+    raise KeyError(f"Колонку для «{canonical}» не знайдено. Є: {list(df.columns)}")
+
 
 def load_unification() -> pd.DataFrame:
-    # читаем первый лист; первый ряд — заголовки
-    df = pd.read_excel(UNIFICATION_PATH, header=0)
+    df = None
+    last_err = None
+    for p in [UNIFICATION_PATH, os.path.join(os.getcwd(), UNIFICATION_PATH), f"/app/{UNIFICATION_PATH}"]:
+        try:
+            df = pd.read_excel(p, header=0)
+            break
+        except Exception as e:
+            last_err = e
+            df = None
+    if df is None:
+        raise RuntimeError(f"Не вдалося прочитати уніфікацію з '{UNIFICATION_PATH}': {last_err}")
 
-    # выбираем реальные колонки по синонимам
-    cat_col     = _pick_col(df, "cat")
-    brand_col   = _pick_col(df, "brand")
-    name_col    = _pick_col(df, "name")
-    pn_col      = _pick_col(df, "pn")
-    analogs_col = _pick_col(df, "analogs")
+    # trim headers and map to canonical
+    df.columns = [str(c).strip() for c in df.columns]
+    # try to map major columns to canonical names
+    try:
+        cat_col = _find_col(df, "Вид техніки")
+        brand_col = _find_col(df, "Бренд")
+        name_col = _find_col(df, "Найменування")
+        pn_col = _find_col(df, "каталожний номер")
+        analogs_col = _find_col(df, "Допустимі аналоги")
+    except Exception:
+        # fallback: assume exact ukr headers
+        cat_col, brand_col, name_col, pn_col, analogs_col = (
+            "Вид техніки", "Бренд", "Найменування", "каталожний номер", "Допустимі аналоги"
+        )
 
-    # приводим к каноническим именам
-    df = df.rename(columns={
-        cat_col: "Вид техніки",
-        brand_col: "Бренд",
-        name_col: "Найменування",
-        pn_col: "каталожний номер",
-        analogs_col: "Допустимі аналоги",
-    })
+    df = df.rename(
+        columns={
+            cat_col: "Вид техніки",
+            brand_col: "Бренд",
+            name_col: "Найменування",
+            pn_col: "каталожний номер",
+            analogs_col: "Допустимі аналоги",
+        }
+    )
 
-    # нормализованные поля для поиска
-    df["cat_norm"] = df["Вид техніки"].astype(str).map(_norm_text)
-    df["brand_norm"] = df["Бренд"].astype(str).map(_norm_text)
-
+    # normalized fields
+    df["cat_norm"] = df["Вид техніки"].astype(str).str.strip().str.lower()
+    df["brand_norm"] = df["Бренд"].astype(str).str.strip().str.lower()
+    df["brand_key"] = df["brand_norm"].apply(_brand_key)
     return df
+
 
 def _require_api_key(x_api_key: Optional[str]):
     if API_KEY and x_api_key != API_KEY:
         raise PermissionError("unauthorized")
 
-# ===== META: списки для UI GPT =================================================
 
+# ===== META: lists for GPT UI =================================================
 @app.get("/meta/types")
 def meta_types(x_api_key: Optional[str] = Header(default=None, convert_underscores=False)):
-    # опциональный ключ
     try:
         _require_api_key(x_api_key)
     except PermissionError:
@@ -122,14 +178,12 @@ def meta_types(x_api_key: Optional[str] = Header(default=None, convert_underscor
     try:
         df = load_unification()
     except Exception:
-        # чтобы GPT не падал — возвращаем пустой список, а не 500
         return {"items": []}
 
-    # уникальные виды по cat_norm, с «человеческим» названием
     out = (
         df[["cat_norm", "Вид техніки"]]
         .dropna()
-        .drop_duplicates(subset=["cat_norm"])
+        .drop_duplicates(subset=["cat_norm"])  # unique by normalized key
         .sort_values("Вид техніки")
         ["Вид техніки"]
         .tolist()
@@ -142,7 +196,6 @@ def meta_brands(
     type: Optional[str] = None,
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
-    # опциональный ключ
     try:
         _require_api_key(x_api_key)
     except PermissionError:
@@ -154,125 +207,143 @@ def meta_brands(
         return {"items": []}
 
     if type:
-        st = _norm_text(type)
+        st = _norm_text(TYPE_ALIASES.get(_norm_text(type), type))
         df = df[df["cat_norm"] == st]
 
-    # берём «человеческие» лейблы брендов
     items = sorted(set(df["Бренд"].dropna().astype(str).str.strip().tolist()))
-
-    # пункт «Всі доступні моделі» показываем всегда (удобно для выбора)
     if "Всі доступні моделі" not in items:
         items = ["Всі доступні моделі"] + items
-
     return {"items": items}
 
 
-# ------------------------------- Routes ---------------------------
+# ------------------------------- Health ---------------------------------
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
+
+# -------------- Robust brand picking (exact -> strict fuzzy -> all) --------------
+
+def _pick_brand(df_cat: pd.DataFrame, selected_brand_raw: str):
+    """Return (used_brand_key, brand_mode, normalized_brand_label)."""
+    sb_raw = _strip(selected_brand_raw)
+    sb_key = _brand_key(sb_raw)
+    norm_all = _norm_text("всі доступні моделі")
+
+    if sb_key in {"всі", "все", "all", norm_all}:
+        return None, "all_manual", "Всі доступні моделі"
+
+    pool_keys = df_cat["brand_key"].dropna().unique().tolist()
+
+    # exact
+    if sb_key in pool_keys:
+        human = df_cat.loc[df_cat["brand_key"] == sb_key, "Бренд"].iloc[0]
+        return sb_key, "exact", str(human)
+
+    # strict fuzzy (0.85)
+    best_key, best_ratio = None, 0.0
+    for k in pool_keys:
+        r = SequenceMatcher(None, sb_key, k).ratio()
+        if r > best_ratio:
+            best_ratio, best_key = r, k
+    if best_key and best_ratio >= 0.85:
+        human = df_cat.loc[df_cat["brand_key"] == best_key, "Бренд"].iloc[0]
+        return best_key, "fuzzy_exact", str(human)
+
+    # fallback: 'всі'
+    has_all = (_norm_text("всі доступні моделі") in df_cat["brand_norm"].values)
+    if has_all:
+        return None, "all_fallback_no_exact", "Всі доступні моделі"
+
+    return None, "none_found_unification_skipped", (sb_raw or "—")
+
+
+# ------------------------------- PREVIEW ---------------------------------
 @app.post("/preview")
 async def preview(
     selected_type: str = Form(...),
     selected_brand: str = Form(...),
     main_file: UploadFile = File(...),
-    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
-    # optional API key
     try:
         _require_api_key(x_api_key)
     except PermissionError:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    # сохраняем входной файл под токен
     token = str(uuid.uuid4())
-    os.makedirs(TMP_DIR, exist_ok=True)
     tmp_main = os.path.join(TMP_DIR, f"{token}.xlsx")
     content = await main_file.read()
     with open(tmp_main, "wb") as f:
         f.write(content)
 
-    # читаем уніфікацію
     try:
         df = load_unification()
     except Exception as e:
         return JSONResponse({"error": f"Помилка уніфікації: {e}"}, status_code=400)
 
-    # --- 1) Фиксируем тип (как в твоём фрагменте: строго по cat_norm) ---
     st_raw = (selected_type or "").strip()
     sb_raw = (selected_brand or "").strip()
-    st = _norm_text(st_raw)
-    sb = _norm_text(sb_raw)
 
-    df_cat = df[df["cat_norm"] == st]
+    # normalize type with aliases
+    st_alias = TYPE_ALIASES.get(_norm_text(st_raw), _norm_text(st_raw))
+    df_cat = df[df["cat_norm"] == st_alias]
     if df_cat.empty:
-        # категория не найдена — подсказываем и выходим (здесь логично вернуть 400)
         choices = df["cat_norm"].dropna().unique().tolist()
-        suggestions = get_close_matches(st, choices, n=3, cutoff=0.6)
-        return JSONResponse(
-            {"error": f"Категорію «{st_raw}» не знайдено", "suggestions": suggestions},
-            status_code=400
-        )
+        suggestions = get_close_matches(_norm_text(st_raw), choices, n=3, cutoff=0.6)
+        return JSONResponse({"error": f"Категорію «{st_raw}» не знайдено", "suggestions": suggestions}, status_code=400)
     normalized_type = df_cat["Вид техніки"].iloc[0]
 
-    # --- 2) Бренд: подправляем к ближайшему и добавляем 'всі доступні моделі' в пул ---
+    # brand pick
+    used_brand_key, brand_mode, normalized_brand = _pick_brand(df_cat, sb_raw)
+
     norm_all = _norm_text("всі доступні моделі")
-    brands_pool = df_cat["brand_norm"].dropna().unique().tolist()
-    pool_with_all = brands_pool + [norm_all]
+    df_all = df_cat[df_cat["brand_norm"] == norm_all]
+    if used_brand_key:
+        df_exact = df_cat[df_cat["brand_key"] == used_brand_key]
+        df_brand = pd.concat([df_exact, df_all], ignore_index=True) if not df_all.empty else df_exact
+    else:
+        df_brand = df_all if not df_all.empty else pd.DataFrame(
+            columns=["Найменування", "каталожний номер", "Допустимі аналоги"]
+        )
 
-    best = get_close_matches(sb, pool_with_all, n=1, cutoff=0.6)
-    if best:
-        sb = best[0]
-
-    # --- 3) Берём строки БРЕНДА ИЛИ 'всі доступні моделі' ---
-    df_brand = df_cat[df_cat["brand_norm"].isin([sb, norm_all])]
-
-    # ⬇️ ВАЖНО: ЕСЛИ НИЧЕГО НЕ НАШЛИ — НЕ ОШИБКА!
-    # Делаем "пустую" уніфікацію: вернём token и продолжим обработку без маппинга.
+    # build preview temp table
     if df_brand.empty:
         temp_df = pd.DataFrame(columns=["C (Найменування)", "D (Каталожний номер)", "E (Допустимі аналоги)"])
-        brand_mode = "none_found_unification_skipped"
-        normalized_brand = sb_raw or "—"
     else:
         temp_df = (
             df_brand[["Найменування", "каталожний номер", "Допустимі аналоги"]]
             .drop_duplicates()
             .reset_index(drop=True)
+            .rename(columns={
+                "Найменування": "C (Найменування)",
+                "каталожний номер": "D (Каталожний номер)",
+                "Допустимі аналоги": "E (Допустимі аналоги)",
+            })
         )
-        temp_df.columns = ["C (Найменування)", "D (Каталожний номер)", "E (Допустимі аналоги)"]
-        if sb == norm_all:
-            brand_mode = "all_manual_or_corrected"
-            normalized_brand = "Всі доступні моделі"
-        elif sb in brands_pool:
-            brand_mode = "exact_plus_all" if norm_all in brands_pool else "exact"
-            normalized_brand = df_cat.loc[df_cat["brand_norm"] == sb, "Бренд"].iloc[0]
-        else:
-            brand_mode = "exact_or_all"
-            normalized_brand = sb_raw
 
-    # сохраняем «превью-таблицу» (пусть даже пустую) рядом с токеном
     tmp_temp = os.path.join(TMP_DIR, f"{token}_temp.parquet")
     temp_df.to_parquet(tmp_temp, index=False)
 
-    # markdown-превью: если таблица пустая — показываем заметку
     if temp_df.empty:
-        preview_markdown = "_Уніфікація для цієї категорії/бренду не знайдена — обробка буде без уніфікації._"
+        preview_markdown = "_Уніфікацію не знайдено — обробка піде без уніфікації._"
     else:
         preview_markdown = tabulate(temp_df, headers=temp_df.columns, tablefmt="github", showindex=False)
 
     return {
         "normalized_type": normalized_type,
         "normalized_brand": normalized_brand,
-        "brand_mode": brand_mode,   # exact | exact_plus_all | all_manual_or_corrected | none_found_unification_skipped
+        "brand_mode": brand_mode,
         "preview_markdown": preview_markdown,
-        "token": token
+        "token": token,
     }
 
+
+# ------------------------------- PREVIEW by URL (fallback) --------------------
 @app.post("/preview_url")
 async def preview_url(
     payload: dict = Body(...),
-    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     try:
         _require_api_key(x_api_key)
@@ -285,7 +356,6 @@ async def preview_url(
     if not selected_type or not selected_brand or not file_url:
         return JSONResponse({"error": "selected_type, selected_brand і file_url обов'язкові"}, status_code=400)
 
-    # 1) Скачиваем файл по URL в tmp под токен (без внешних зависимостей)
     token = str(uuid.uuid4())
     os.makedirs(TMP_DIR, exist_ok=True)
     tmp_main = os.path.join(TMP_DIR, f"{token}.xlsx")
@@ -296,7 +366,7 @@ async def preview_url(
     except Exception as e:
         return JSONResponse({"error": f"Не вдалося завантажити файл за URL: {e}"}, status_code=400)
 
-    # 2) Дальше — РОВНО та ж логіка, що й у /preview:
+    # reuse preview logic
     try:
         df = load_unification()
     except Exception as e:
@@ -304,78 +374,70 @@ async def preview_url(
 
     st_raw = selected_type
     sb_raw = selected_brand
-    st = _norm_text(st_raw)
-    sb = _norm_text(sb_raw)
 
-    df_cat = df[df["cat_norm"] == st]
+    st_alias = TYPE_ALIASES.get(_norm_text(st_raw), _norm_text(st_raw))
+    df_cat = df[df["cat_norm"] == st_alias]
     if df_cat.empty:
         choices = df["cat_norm"].dropna().unique().tolist()
-        suggestions = get_close_matches(st, choices, n=3, cutoff=0.6)
+        suggestions = get_close_matches(_norm_text(st_raw), choices, n=3, cutoff=0.6)
         return JSONResponse({"error": f"Категорію «{st_raw}» не знайдено", "suggestions": suggestions}, status_code=400)
     normalized_type = df_cat["Вид техніки"].iloc[0]
 
+    used_brand_key, brand_mode, normalized_brand = _pick_brand(df_cat, sb_raw)
+
     norm_all = _norm_text("всі доступні моделі")
-    brands_pool = df_cat["brand_norm"].dropna().unique().tolist()
-    pool_with_all = brands_pool + [norm_all]
-
-    best = get_close_matches(sb, pool_with_all, n=1, cutoff=0.6)
-    if best:
-        sb = best[0]
-
-    df_brand = df_cat[df_cat["brand_norm"].isin([sb, norm_all])]
+    df_all = df_cat[df_cat["brand_norm"] == norm_all]
+    if used_brand_key:
+        df_exact = df_cat[df_cat["brand_key"] == used_brand_key]
+        df_brand = pd.concat([df_exact, df_all], ignore_index=True) if not df_all.empty else df_exact
+    else:
+        df_brand = df_all if not df_all.empty else pd.DataFrame(
+            columns=["Найменування", "каталожний номер", "Допустимі аналоги"]
+        )
 
     if df_brand.empty:
         temp_df = pd.DataFrame(columns=["C (Найменування)", "D (Каталожний номер)", "E (Допустимі аналоги)"])
-        brand_mode = "none_found_unification_skipped"
-        normalized_brand = sb_raw or "—"
     else:
         temp_df = (
             df_brand[["Найменування", "каталожний номер", "Допустимі аналоги"]]
-            .drop_duplicates().reset_index(drop=True)
+            .drop_duplicates()
+            .reset_index(drop=True)
+            .rename(columns={
+                "Найменування": "C (Найменування)",
+                "каталожний номер": "D (Каталожний номер)",
+                "Допустимі аналоги": "E (Допустимі аналоги)",
+            })
         )
-        temp_df.columns = ["C (Найменування)", "D (Каталожний номер)", "E (Допустимі аналоги)"]
-        if sb == norm_all:
-            brand_mode = "all_manual_or_corrected"
-            normalized_brand = "Всі доступні моделі"
-        elif sb in brands_pool:
-            brand_mode = "exact_plus_all" if norm_all in brands_pool else "exact"
-            normalized_brand = df_cat.loc[df_cat["brand_norm"] == sb, "Бренд"].iloc[0]
-        else:
-            brand_mode = "exact_or_all"
-            normalized_brand = sb_raw
 
     tmp_temp = os.path.join(TMP_DIR, f"{token}_temp.parquet")
     temp_df.to_parquet(tmp_temp, index=False)
 
-    preview_markdown = (
-        "_Уніфікацію не знайдено — обробка піде без уніфікації._"
-        if temp_df.empty else
-        tabulate(temp_df, headers=temp_df.columns, tablefmt="github", showindex=False)
-    )
+    if temp_df.empty:
+        preview_markdown = "_Уніфікацію не знайдено — обробка піде без уніфікації._"
+    else:
+        preview_markdown = tabulate(temp_df, headers=temp_df.columns, tablefmt="github", showindex=False)
 
     return {
         "normalized_type": normalized_type,
         "normalized_brand": normalized_brand,
         "brand_mode": brand_mode,
         "preview_markdown": preview_markdown,
-        "token": token
+        "token": token,
     }
 
 
-
+# ------------------------------- PROCESS ---------------------------------
 @app.post("/process")
 async def process(
     token: Optional[str] = Form(None),
     payload: Optional[dict] = Body(None),
-    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
-    # optional API key
     try:
         _require_api_key(x_api_key)
     except PermissionError:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    # поддерживаем и form-data, и JSON
     if not token and isinstance(payload, dict):
         token = payload.get("token")
     if not token:
@@ -386,7 +448,7 @@ async def process(
     if not os.path.exists(tmp_main):
         return JSONResponse({"error": "invalid token"}, status_code=400)
 
-    # читаем превью-таблицу (может быть пустой или отсутствовать)
+    # read preview temp table
     temp_df = pd.DataFrame()
     if os.path.exists(tmp_temp):
         try:
@@ -394,116 +456,167 @@ async def process(
         except Exception:
             temp_df = pd.DataFrame()
 
-    # ← вот тот самый «ранний флаг»
     unification_enabled = not temp_df.empty
 
     wb = openpyxl.load_workbook(tmp_main)
     ws = wb.active
 
-    red    = PatternFill(start_color="FFFF0000", end_color="FFFF0000", fill_type="solid")
+    red = PatternFill(start_color="FFFF0000", end_color="FFFF0000", fill_type="solid")
     yellow = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid")
-    none   = PatternFill()
+    none = PatternFill()
 
-    def mark(cell, color, flags):
-        """color: 'red' | 'yellow' | 'none'; flags tracks итог для колонки A"""
-        if color == "red":
-            cell.fill = red
-            flags["had_red"] = True
-        elif color == "yellow":
-            cell.fill = yellow
-            flags["had_yellow"] = True
-        else:
-            cell.fill = none
+    # Build header index by fuzzy contains
+    headers = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+    norm_headers = [_norm_text(h) for h in headers]
 
-    from difflib import SequenceMatcher
+    def _find_idx(cands):
+        for i, h in enumerate(norm_headers):
+            for c in cands:
+                if c in h:
+                    return i
+        return None
+
+    idx_name = _find_idx(["наймен", "наимен", "назва", "название", "name"]) or 0
+    idx_desc = _find_idx(["опис", "описание", "description"]) or (1 if len(headers) > 1 else 0)
+    idx_brand = _find_idx(["виробник/бренд", "виробник", "производитель", "бренд", "brand"]) or (2 if len(headers) > 2 else 0)
+    idx_pn_sup = _find_idx(["каталожний номер виробника", "артикул виробника", "каталожний номер", "артикул", "part number", "pn"]) or (3 if len(headers) > 3 else 0)
+    idx_orig = _find_idx(["оригінал/аналог", "оригинал/аналог"]) or (4 if len(headers) > 4 else 0)
+
+    temp_records = temp_df.to_dict("records")
+
+    # We use normalized_brand from preview to check 'original' lines
+    # If temp table absent, fallback to empty string (won't enforce brand on originals)
+    normalized_brand = ""
+    if os.path.exists(tmp_temp):
+        try:
+            # try to read brand from parquet metadata is complex; so skip and relax
+            pass
+        except Exception:
+            pass
+
+    red_rows = yellow_rows = 0
 
     for row in ws.iter_rows(min_row=2):
-        # сброс заливки
+        # reset fills
         for cell in row:
             cell.fill = none
 
-        # A=0, D=3, J=9, L=11, P=15
-        A = str(row[0].value or "")
-        D = str(row[3].value or "")
-        J = str(row[9].value or "")
-        L = str(row[11].value or "")
-        P = str(row[15].value or "").lower()
+        A = _strip(row[idx_name].value)
+        D = _strip(row[idx_desc].value)
+        J = _strip(row[idx_brand].value)
+        L = _strip(row[idx_pn_sup].value)
+        P = _strip(row[idx_orig].value).lower()
 
-        flags = {"had_red": False, "had_yellow": False}
+        had_red = False
+        had_yellow = False
 
         if P == "аналог":
             if not unification_enabled:
-                # Уніфікації нет — ничего не подсвечиваем для «аналог» (просто пропускаем)
-                pass
+                pass  # no highlighting when unification missing
             else:
                 matched = False
-                allowed = []
+                allowed: list[str] = []
 
-                # 1) Совпадение по каталожному номеру
-                for _, r in temp_df.iterrows():
-                    pn = str(r["D (Каталожний номер)"])
-                    nums = [pn, pn.replace(".", "")]
-                    if any(n and n in D for n in nums):
+                # 1) PN in description or equals to supplier PN (with variants)
+                for r in temp_records:
+                    pn = _strip(r.get("D (Каталожний номер)", ""))
+                    if not pn:
+                        continue
+                    variants = _pn_variants(pn)
+                    if any(v and v in D for v in variants) or (L and (L in variants or re.sub(r"[.\-\s]", "", L) in variants)):
                         matched = True
-                        allowed = [x.strip() for x in str(r["E (Допустимі аналоги)"]).split(",") if x.strip()]
+                        E = _strip(r.get("E (Допустимі аналоги)", ""))
+                        allowed = [x.strip() for x in E.split(",") if x.strip()]
                         break
 
-                # 2) Если PN не нашли — сравнение по названию
-                if not matched:
+                ratio = 0.0
+                if not matched and len(temp_records) > 0:
                     base = A.split(",")[0].split("|")[0].strip().lower()
-                    sims = temp_df["C (Найменування)"].apply(
-                        lambda x: SequenceMatcher(None, base, str(x).lower()).ratio()
-                    )
-                    if not sims.empty:
-                        idx = sims.idxmax()
-                        ratio = float(sims.max())
-                        allowed = [x.strip() for x in str(temp_df.at[idx, "E (Допустимі аналоги)"]).split(",") if x.strip()]
+                    best_idx = -1
+                    best_ratio = -1
+                    for i, r in enumerate(temp_records):
+                        cval = str(r.get("C (Найменування)", "")).lower()
+                        rratio = SequenceMatcher(None, base, cval).ratio()
+                        if rratio > best_ratio:
+                            best_ratio = rratio
+                            best_idx = i
+                    ratio = best_ratio if best_idx >= 0 else 0.0
+                    if best_idx >= 0:
+                        E = _strip(temp_records[best_idx].get("E (Допустимі аналоги)", ""))
+                        allowed = [x.strip() for x in E.split(",") if x.strip()]
+                    if ratio < 0.6:
+                        row[idx_orig].fill = red
+                        had_red = True
+                    elif ratio < 0.8:
+                        row[idx_name].fill = yellow
+                        row[idx_orig].fill = yellow
+                        had_yellow = True
 
-                        if ratio < 0.6:
-                            mark(row[15], "red", flags)   # P
-                        elif ratio < 0.8:
-                            # неуверенно — подсветим мягко
-                            mark(row[0], "yellow", flags)  # A
-                            mark(row[15], "yellow", flags)
-
-                # 3) Проверка бренда J против допустимых аналогов
-                if allowed and J.strip():
-                    ok = any(SequenceMatcher(None, J.lower(), a.lower()).ratio() >= 0.8 for a in allowed)
+                # 3) Brand J vs allowed analogs
+                if allowed and J:
+                    ok = any(_same_brand(J, a) or SequenceMatcher(None, _norm_text(J), _norm_text(a)).ratio() >= 0.8 for a in allowed)
                     if not ok:
-                        close = any(SequenceMatcher(None, J.lower(), a.lower()).ratio() >= 0.6 for a in allowed)
-                        mark(row[9], "yellow" if close else "red", flags)  # J
-                        mark(row[15], "yellow" if close else "red", flags) # P
+                        close = any(SequenceMatcher(None, _norm_text(J), _norm_text(a)).ratio() >= 0.6 for a in allowed)
+                        row[idx_brand].fill = yellow if close else red
+                        row[idx_orig].fill = yellow if close else red
+                        had_yellow = had_yellow or close
+                        had_red = had_red or (not close)
         else:
-            # базовая проверка: если в L указан код, он должен содержаться в D
+            # ORIGINAL line checks: brand & supplier PN in description
+            # Brand: use aliases first, then similarity
+            if normalized_brand:
+                ref_brand = normalized_brand
+            else:
+                ref_brand = J  # if we don't know, don't enforce
+            if not _same_brand(J, ref_brand):
+                ratio_j = SequenceMatcher(None, _norm_text(J), _norm_text(ref_brand)).ratio()
+                if ratio_j < 0.6:
+                    row[idx_brand].fill = red
+                    had_red = True
+                elif ratio_j < 0.8 or _has_cyr(J):
+                    row[idx_brand].fill = yellow
+                    had_yellow = True
             if L and L not in D:
-                mark(row[11], "red", flags)
+                row[idx_pn_sup].fill = red
+                had_red = True
 
-        # сводная подсветка для A: красный > жёлтый > нет
-        if flags["had_red"]:
-            row[0].fill = red
-        elif flags["had_yellow"]:
-            row[0].fill = yellow
-        else:
-            row[0].fill = none
+        if had_red:
+            row[idx_name].fill = red
+            red_rows += 1
+        elif had_yellow:
+            # keep yellow on name only if no red
+            if row[idx_name].fill != red:
+                row[idx_name].fill = yellow
+            yellow_rows += 1
 
-    original_name = os.path.splitext(os.path.basename(tmp_main))[0]
-    out_name = f"{original_name}_processed.xlsx"
+    out_name = f"{token}_processed.xlsx"
     out_path = os.path.join(TMP_DIR, out_name)
     wb.save(out_path)
 
     return {"download_url": f"/download/{token}"}
 
+
 @app.get("/download/{token}")
 async def download(token: str):
-    out_name = None
-    for fname in os.listdir(TMP_DIR):
-        if fname.startswith(token) and fname.endswith("_processed.xlsx"):
-            out_name = fname
-            break
-    if not out_name:
+    out_name = f"{token}_processed.xlsx"
+    path = os.path.join(TMP_DIR, out_name)
+    if not os.path.exists(path):
+        # fallback: find by prefix
+        for fname in os.listdir(TMP_DIR):
+            if fname.startswith(token) and fname.endswith("_processed.xlsx"):
+                path = os.path.join(TMP_DIR, fname)
+                break
+    if not os.path.exists(path):
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(
-        os.path.join(TMP_DIR, out_name),
+        path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=out_name
+        filename=os.path.basename(path),
     )
+
+
+# ------------------------------- Main (local run) ----------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
