@@ -108,6 +108,64 @@ def _require_api_key(x_api_key: Optional[str]):
     if API_KEY and x_api_key != API_KEY:
         raise PermissionError("unauthorized")
 
+# ===== META: списки для UI GPT =================================================
+
+@app.get("/meta/types")
+def meta_types(x_api_key: Optional[str] = Header(default=None, convert_underscores=False)):
+    # опциональный ключ
+    try:
+        _require_api_key(x_api_key)
+    except PermissionError:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        df = load_unification()
+    except Exception:
+        # чтобы GPT не падал — возвращаем пустой список, а не 500
+        return {"items": []}
+
+    # уникальные виды по cat_norm, с «человеческим» названием
+    out = (
+        df[["cat_norm", "Вид техніки"]]
+        .dropna()
+        .drop_duplicates(subset=["cat_norm"])
+        .sort_values("Вид техніки")
+        ["Вид техніки"]
+        .tolist()
+    )
+    return {"items": out}
+
+
+@app.get("/meta/brands")
+def meta_brands(
+    type: Optional[str] = None,
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
+):
+    # опциональный ключ
+    try:
+        _require_api_key(x_api_key)
+    except PermissionError:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        df = load_unification()
+    except Exception:
+        return {"items": []}
+
+    if type:
+        st = _norm_text(type)
+        df = df[df["cat_norm"] == st]
+
+    # берём «человеческие» лейблы брендов
+    items = sorted(set(df["Бренд"].dropna().astype(str).str.strip().tolist()))
+
+    # пункт «Всі доступні моделі» показываем всегда (удобно для выбора)
+    if "Всі доступні моделі" not in items:
+        items = ["Всі доступні моделі"] + items
+
+    return {"items": items}
+
+
 # ------------------------------- Routes ---------------------------
 @app.get("/healthz")
 def healthz():
