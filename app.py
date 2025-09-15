@@ -3,7 +3,6 @@
 
 import os
 import uuid
-import json
 import re
 from typing import Optional
 from urllib.request import urlopen, Request
@@ -15,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 from difflib import get_close_matches, SequenceMatcher
 from tabulate import tabulate
+import json
 import openpyxl
 from openpyxl.styles import PatternFill
 
@@ -325,14 +325,30 @@ async def preview(
 
     tmp_temp = os.path.join(TMP_DIR, f"{token}_temp.parquet")
     temp_df.to_parquet(tmp_temp, index=False)
-    tmp_meta = os.path.join(TMP_DIR, f"{token}_meta.json")
-    with open(tmp_meta, "w", encoding="utf-8") as mf:
-    json.dump({
-        "normalized_type": str(normalized_type),
-        "normalized_brand": str(normalized_brand),
-        "brand_mode": str(brand_mode),
-    }, mf, ensure_ascii=False)
 
+    # save meta for process (remember chosen brand & mode)
+    try:
+        tmp_meta = os.path.join(TMP_DIR, f"{token}_meta.json")
+        with open(tmp_meta, "w", encoding="utf-8") as mf:
+            json.dump({
+                "normalized_type": str(normalized_type),
+                "normalized_brand": str(normalized_brand),
+                "brand_mode": str(brand_mode),
+            }, mf, ensure_ascii=False)
+    except Exception:
+        pass
+
+    if temp_df.empty:rocess (remember chosen brand & mode)
+    try:
+        tmp_meta = os.path.join(TMP_DIR, f"{token}_meta.json")
+        with open(tmp_meta, "w", encoding="utf-8") as mf:
+            json.dump({
+                "normalized_type": str(normalized_type),
+                "normalized_brand": str(normalized_brand),
+                "brand_mode": str(brand_mode),
+            }, mf, ensure_ascii=False)
+    except Exception:
+        pass
 
     if temp_df.empty:
         preview_markdown = "_Уніфікацію не знайдено — обробка піде без уніфікації._"
@@ -420,14 +436,6 @@ async def preview_url(
 
     tmp_temp = os.path.join(TMP_DIR, f"{token}_temp.parquet")
     temp_df.to_parquet(tmp_temp, index=False)
-    tmp_meta = os.path.join(TMP_DIR, f"{token}_meta.json")
-    with open(tmp_meta, "w", encoding="utf-8") as mf:
-    json.dump({
-        "normalized_type": str(normalized_type),
-        "normalized_brand": str(normalized_brand),
-        "brand_mode": str(brand_mode),
-    }, mf, ensure_ascii=False)
-
 
     if temp_df.empty:
         preview_markdown = "_Уніфікацію не знайдено — обробка піде без уніфікації._"
@@ -464,17 +472,6 @@ async def process(
     tmp_temp = os.path.join(TMP_DIR, f"{token}_temp.parquet")
     if not os.path.exists(tmp_main):
         return JSONResponse({"error": "invalid token"}, status_code=400)
-
-    normalized_brand = ""
-    tmp_meta = os.path.join(TMP_DIR, f"{token}_meta.json")
-    if os.path.exists(tmp_meta):
-    try:
-        with open(tmp_meta, "r", encoding="utf-8") as mf:
-            m = json.load(mf)
-            normalized_brand = str(m.get("normalized_brand", ""))
-    except Exception:
-        pass
-
 
     # read preview temp table
     temp_df = pd.DataFrame()
@@ -515,10 +512,15 @@ async def process(
     # We use normalized_brand from preview to check 'original' lines
     # If temp table absent, fallback to empty string (won't enforce brand on originals)
     normalized_brand = ""
-    if os.path.exists(tmp_temp):
+    # read normalized_brand saved at preview stage
+    tmp_meta = os.path.join(TMP_DIR, f"{token}_meta.json")
+    if os.path.exists(tmp_meta):
         try:
-            # try to read brand from parquet metadata is complex; so skip and relax
-            pass
+            with open(tmp_meta, "r", encoding="utf-8") as mf:
+                m = json.load(mf)
+                normalized_brand = str(m.get("normalized_brand", ""))
+        except Exception:
+            normalized_brand = ""
         except Exception:
             pass
 
