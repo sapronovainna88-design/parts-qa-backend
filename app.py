@@ -1,5 +1,6 @@
 # app.py — FastAPI backend for Railway (robust version)
 import os, io, uuid, re
+import requests
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, Body, Header
@@ -267,6 +268,112 @@ async def preview(
         "preview_markdown": preview_markdown,
         "token": token
     }
+
+@app.post("/preview_url")
+async def preview_url(
+    payload: dict = Body(...),
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+):
+    """
+    Альтернатива multipart: принимает JSON с полями
+    selected_type, selected_brand, file_url (URI),
+    скачивает файл и дальше делает то же, что /preview.
+    """
+    # optional API key
+    try:
+        _require_api_key(x_api_key)
+    except PermissionError:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    selected_type = str(payload.get("selected_type", "")).strip()
+    selected_brand = str(payload.get("selected_brand", "")).strip()
+    file_url = str(payload.get("file_url", "")).strip()
+    if not selected_type or not selected_brand or not file_url:
+        return JSONResponse({"error": "selected_type, selected_brand и file_url обязательны"}, status_code=400)
+
+    # 1) Скачиваем файл по URL и кладём в tmp под токен
+    token = str(uuid.uuid4())
+    os.makedirs(TMP_DIR, exist_ok=True)
+    tmp_main = os.path.join(TMP_DIR, f"{token}.xlsx")
+    try:
+        r = requests.get(file_url, timeout=60)
+        r.raise_for_status()
+        with open(tmp_main, "wb") as f:
+            f.write(r.content)
+    except Exception as e:
+        return JSONResponse({"error": f"Не удалось скачать файл по URL: {e}"}, status_code=400)
+
+    # 2) Загружаем уніфікацію
+    try:
+        df = load_unification()
+    except Exception as e:
+        return JSONResponse({"error": f"Помилка уніфікації: {e}"}, status_code=400)
+
+    # ==== ЛОГИКА ПРЕВЬЮ КАК В ТВОЕЙ ВЕРСИИ ====
+    # строгое сопоставление по cat_norm
+    st_raw = selected_type
+    sb_raw = selected_brand
+    st = _norm_text(st_raw)
+    sb = _norm_text(sb_raw)
+
+    df_cat = df[df["cat_norm"] == st]
+    if df_cat.empty:
+        choices = df["cat_norm"].dropna().unique().tolist()
+        suggestions = get_close_matches(st, choices, n=3, cutoff=0.6)
+        return JSONResponse(
+            {"error": f"Категорію «{st_raw}» не знайдено", "suggestions": suggestions},
+            status_code=400
+        )
+    normalized_type = df_cat["Вид техніки"].iloc[0]
+
+    norm_all = _norm_text("всі доступні моделі")
+    brands_pool = df_cat["brand_norm"].dropna().unique().tolist()
+    pool_with_all = brands_pool + [norm_all]
+
+    best = get_close_matches(sb, pool_with_all, n=1, cutoff=0.6)
+    if best:
+        sb = best[0]
+
+    df_brand = df_cat[df_cat["brand_norm"].isin([sb, norm_all])]
+
+    # пустая уніфікація — это НЕ ошибка
+    if df_brand.empty:
+        temp_df = pd.DataFrame(columns=["C (Найменування)", "D (Каталожний номер)", "E (Допустимі аналоги)"])
+        brand_mode = "none_found_unification_skipped"
+        normalized_brand = sb_raw or "—"
+    else:
+        temp_df = (
+            df_brand[["Найменування", "каталожний номер", "Допустимі аналоги"]]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+        temp_df.columns = ["C (Найменування)", "D (Каталожний номер)", "E (Допустимі аналоги)"]
+        if sb == norm_all:
+            brand_mode = "all_manual_or_corrected"
+            normalized_brand = "Всі доступні моделі"
+        elif sb in brands_pool:
+            brand_mode = "exact_plus_all" if norm_all in brands_pool else "exact"
+            normalized_brand = df_cat.loc[df_cat["brand_norm"] == sb, "Бренд"].iloc[0]
+        else:
+            brand_mode = "exact_or_all"
+            normalized_brand = sb_raw
+
+    tmp_temp = os.path.join(TMP_DIR, f"{token}_temp.parquet")
+    temp_df.to_parquet(tmp_temp, index=False)
+
+    if temp_df.empty:
+        preview_markdown = "_Уніфікацію не знайдено — обробка піде без уніфікації._"
+    else:
+        preview_markdown = tabulate(temp_df, headers=temp_df.columns, tablefmt="github", showindex=False)
+
+    return {
+        "normalized_type": normalized_type,
+        "normalized_brand": normalized_brand,
+        "brand_mode": brand_mode,
+        "preview_markdown": preview_markdown,
+        "token": token
+    }
+
 
 @app.post("/process")
 async def process(
