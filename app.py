@@ -338,18 +338,6 @@ async def preview(
     except Exception:
         pass
 
-    if temp_df.empty:rocess (remember chosen brand & mode)
-    try:
-        tmp_meta = os.path.join(TMP_DIR, f"{token}_meta.json")
-        with open(tmp_meta, "w", encoding="utf-8") as mf:
-            json.dump({
-                "normalized_type": str(normalized_type),
-                "normalized_brand": str(normalized_brand),
-                "brand_mode": str(brand_mode),
-            }, mf, ensure_ascii=False)
-    except Exception:
-        pass
-
     if temp_df.empty:
         preview_markdown = "_Уніфікацію не знайдено — обробка піде без уніфікації._"
     else:
@@ -437,6 +425,18 @@ async def preview_url(
     tmp_temp = os.path.join(TMP_DIR, f"{token}_temp.parquet")
     temp_df.to_parquet(tmp_temp, index=False)
 
+    # save meta for process (remember chosen brand & mode)
+    try:
+        tmp_meta = os.path.join(TMP_DIR, f"{token}_meta.json")
+        with open(tmp_meta, "w", encoding="utf-8") as mf:
+            json.dump({
+                "normalized_type": str(normalized_type),
+                "normalized_brand": str(normalized_brand),
+                "brand_mode": str(brand_mode),
+            }, mf, ensure_ascii=False)
+    except Exception:
+        pass
+
     if temp_df.empty:
         preview_markdown = "_Уніфікацію не знайдено — обробка піде без уніфікації._"
     else:
@@ -521,8 +521,6 @@ async def process(
                 normalized_brand = str(m.get("normalized_brand", ""))
         except Exception:
             normalized_brand = ""
-        except Exception:
-            pass
 
     red_rows = yellow_rows = 0
 
