@@ -19,7 +19,7 @@ from openpyxl.styles import PatternFill
 
 # ----------------------------- Config -----------------------------
 APP_PORT = int(os.getenv("PORT", "8000"))
-UNIFICATION_PATH = os.getenv("UNIFICATION_PATH", "уніфікаувція для ШІ.xlsx")
+UNIFICATION_PATH = os.getenv("UNIFICATION_PATH", "unifikatsiya.xlsx")
 TMP_DIR = os.getenv("TMP_DIR", "tmp")
 API_KEY = os.getenv("X_API_KEY")  # optional, header: X-API-Key
 os.makedirs(TMP_DIR, exist_ok=True)
